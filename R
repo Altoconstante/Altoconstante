@@ -1,0 +1,180 @@
+# 加载所需的库
+library(terra)
+library(tidyverse)
+library(ggplot2)
+library(progress)
+
+# 设置文件路径
+input_dir <- "E:/Data/sif/masked_by_year"
+output_dir <- "E:/Data/sif/sif_results"
+dir.create(output_dir, showWarnings = FALSE)
+
+# 输出文件定义
+output_csv <- file.path(output_dir, "sif_phenology_results.csv")
+output_sos_map <- file.path(output_dir, "sif_sos_mean.tif")
+output_eos_map <- file.path(output_dir, "sif_eos_mean.tif")
+output_los_map <- file.path(output_dir, "sif_los_mean.tif")
+output_sos_slope_map <- file.path(output_dir, "sif_sos_slope.tif")
+output_eos_slope_map <- file.path(output_dir, "sif_eos_slope.tif")
+output_los_slope_map <- file.path(output_dir, "sif_los_slope.tif")
+output_sos_pval_map <- file.path(output_dir, "sif_sos_pvalue.tif")
+output_eos_pval_map <- file.path(output_dir, "sif_eos_pvalue.tif")
+output_los_pval_map <- file.path(output_dir, "sif_los_pvalue.tif")
+
+# 定义趋势分析函数
+calc_slope <- function(x) {
+  if (all(is.na(x)) || length(na.omit(x)) < 3) return(NA_real_)
+  time <- 1:length(x)
+  fit <- lm(x ~ time, na.action = na.exclude)
+  return(as.double(coef(fit)[2]))
+}
+
+calc_pvalue <- function(x) {
+  if (all(is.na(x)) || length(na.omit(x)) < 3) return(NA_real_)
+  time <- 1:length(x)
+  fit <- lm(x ~ time, na.action = na.exclude)
+  return(as.double(summary(fit)$coefficients[2, 4]))
+}
+
+# 波段索引转换为DOY的函数
+band_to_doy <- function(band_index) {
+  # 假设每年46个波段，每个波段代表8天
+  # 第一个波段代表第5天（1月5日），因为8天合成的中心点是第5天
+  # 后续每个波段增加8天
+  return(5 + (band_index - 1) * 8)
+}
+
+# 修改后的物候提取函数（返回DOY而不是波段索引）
+extract_sos <- function(x, threshold_factor = 0.2) {
+  if (all(is.na(x)) || sum(!is.na(x)) < 5) return(NA_real_)
+  smoothed <- stats::filter(x, rep(1/5, 5), sides = 2)
+  if (all(is.na(smoothed))) return(NA_real_)
+  smoothed[is.na(smoothed)] <- x[is.na(smoothed)]
+  min_sif <- min(smoothed, na.rm = TRUE)
+  max_sif <- max(smoothed, na.rm = TRUE)
+  if (max_sif == min_sif) return(NA_real_)
+  threshold <- min_sif + threshold_factor * (max_sif - min_sif)
+  above_thresh <- which(smoothed >= threshold)
+  if (length(above_thresh) == 0) return(NA_real_)
+  return(band_to_doy(above_thresh[1]))  # 转换为DOY
+}
+
+extract_eos <- function(x, threshold_factor = 0.2) {
+  if (all(is.na(x)) || sum(!is.na(x)) < 5) return(NA_real_)
+  smoothed <- stats::filter(x, rep(1/5, 5), sides = 2)
+  if (all(is.na(smoothed))) return(NA_real_)
+  smoothed[is.na(smoothed)] <- x[is.na(smoothed)]
+  min_sif <- min(smoothed, na.rm = TRUE)
+  max_sif <- max(smoothed, na.rm = TRUE)
+  if (max_sif == min_sif) return(NA_real_)
+  threshold <- min_sif + threshold_factor * (max_sif - min_sif)
+  above_thresh <- which(smoothed >= threshold)
+  if (length(above_thresh) == 0) return(NA_real_)
+  return(band_to_doy(tail(above_thresh, 1)))  # 转换为DOY
+}
+
+# 初始化存储
+results <- data.frame(Year = integer(), 
+                      Mean_SOS = numeric(), 
+                      Mean_EOS = numeric(), 
+                      Mean_LOS = numeric())
+pheno_stack <- list(SOS = list(), EOS = list(), LOS = list())
+
+years <- 2001:2020
+pb <- progress_bar$new(format = "处理 [:bar] :percent [耗时 :elapsed, 剩余 :eta]", 
+                       total = length(years), 
+                       clear = FALSE, 
+                       width = 60)
+
+# 主处理循环
+for (year in years) {
+  sif_file <- file.path(input_dir, paste0("SIF_Grass_", year, ".tif"))
+  
+  if (!file.exists(sif_file)) {
+    cat(sprintf("跳过缺失文件: %s\n", basename(sif_file)))
+    next
+  }
+  
+  pb$tick()
+  sif_data <- rast(sif_file)
+  n_bands <- nlyr(sif_data)
+  cat(sprintf("处理 %d 年，波段数: %d\n", year, n_bands))
+  
+  # 提取物候参数（现在返回的是DOY）
+  sos <- app(sif_data, fun = extract_sos, cores = 1)
+  eos <- app(sif_data, fun = extract_eos, cores = 1)
+  los <- eos - sos  # LOS仍然是天数差
+  
+  pheno_stack$SOS[[as.character(year)]] <- sos
+  pheno_stack$EOS[[as.character(year)]] <- eos
+  pheno_stack$LOS[[as.character(year)]] <- los
+  
+  results <- rbind(results, data.frame(
+    Year = year,
+    Mean_SOS = global(sos, "mean", na.rm = TRUE)[1, 1],
+    Mean_EOS = global(eos, "mean", na.rm = TRUE)[1, 1],
+    Mean_LOS = global(los, "mean", na.rm = TRUE)[1, 1]
+  ))
+  
+  rm(sif_data, sos, eos, los)
+  gc()
+}
+
+# 保存年度结果
+write_csv(results, output_csv)
+cat(sprintf("年度结果已保存到 %s\n", output_csv))
+
+# 计算多年平均值
+sos_mean <- mean(rast(pheno_stack$SOS), na.rm = TRUE)
+eos_mean <- mean(rast(pheno_stack$EOS), na.rm = TRUE)
+los_mean <- mean(rast(pheno_stack$LOS), na.rm = TRUE)
+
+writeRaster(sos_mean, output_sos_map, overwrite = TRUE, datatype = "FLT4S")
+writeRaster(eos_mean, output_eos_map, overwrite = TRUE, datatype = "FLT4S")
+writeRaster(los_mean, output_los_map, overwrite = TRUE, datatype = "FLT4S")
+cat(sprintf("多年平均空间分布图已保存到 %s, %s, %s\n", output_sos_map, output_eos_map, output_los_map))
+
+# 趋势分析
+sos_stack <- rast(pheno_stack$SOS)
+eos_stack <- rast(pheno_stack$EOS)
+los_stack <- rast(pheno_stack$LOS)
+
+sos_slope <- app(sos_stack, fun = calc_slope, cores = 1)
+eos_slope <- app(eos_stack, fun = calc_slope, cores = 1)
+los_slope <- app(los_stack, fun = calc_slope, cores = 1)
+
+sos_pval <- app(sos_stack, fun = calc_pvalue, cores = 1)
+eos_pval <- app(eos_stack, fun = calc_pvalue, cores = 1)
+los_pval <- app(los_stack, fun = calc_pvalue, cores = 1)
+
+# 保存趋势结果
+writeRaster(sos_slope, output_sos_slope_map, overwrite = TRUE, datatype = "FLT4S")
+writeRaster(eos_slope, output_eos_slope_map, overwrite = TRUE, datatype = "FLT4S")
+writeRaster(los_slope, output_los_slope_map, overwrite = TRUE, datatype = "FLT4S")
+writeRaster(sos_pval, output_sos_pval_map, overwrite = TRUE, datatype = "FLT4S")
+writeRaster(eos_pval, output_eos_pval_map, overwrite = TRUE, datatype = "FLT4S")
+writeRaster(los_pval, output_los_pval_map, overwrite = TRUE, datatype = "FLT4S")
+cat(sprintf("趋势分析结果已保存到 %s 等文件\n", output_dir))
+
+# 可视化
+ggplot(results, aes(x = Year)) +
+  geom_line(aes(y = Mean_SOS, color = "SOS"), linewidth = 1) +
+  geom_point(aes(y = Mean_SOS, color = "SOS"), size = 2) +
+  geom_line(aes(y = Mean_EOS, color = "EOS"), linewidth = 1) +
+  geom_point(aes(y = Mean_EOS, color = "EOS"), size = 2) +
+  geom_line(aes(y = Mean_LOS, color = "LOS"), linewidth = 1) +
+  geom_point(aes(y = Mean_LOS, color = "LOS"), size = 2) +
+  labs(title = "SIF 物候参数年际变化", x = "年份", y = "DOY") +
+  scale_color_manual(values = c("SOS" = "blue", "EOS" = "red", "LOS" = "green")) +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+
+ggsave(file.path(output_dir, "sif_phenology_trends.png"), width = 8, height = 5, dpi = 300)
+cat(sprintf("趋势图已保存到 %s\n", file.path(output_dir, "sif_phenology_trends.png")))
+
+# 清理内存
+rm(results, pheno_stack, sos_stack, eos_stack, los_stack, 
+   sos_mean, eos_mean, los_mean, sos_slope, eos_slope, los_slope, 
+   sos_pval, eos_pval, los_pval)
+gc()
+cat("内存清理完成。\n")
